@@ -9,6 +9,12 @@ import numpy as np
 from datetime import date
 from cryptography.fernet import Fernet
 import base64
+import threading
+import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ─────────────────────────────────────────────
 #  CONSTANTS & PATHS
@@ -168,6 +174,25 @@ def generate_password(length: int = 16) -> str:
             any(c.isdigit() for c in pwd) and
             any(c in string.punctuation for c in pwd)):
             return pwd
+
+
+# ─────────────────────────────────────────────
+#  BREACH CHECKER (HaveIBeenPwned API)
+# ─────────────────────────────────────────────
+def check_breach(password: str) -> int:
+    """Returns breach count. Uses k-anonymity — only 5 chars of SHA1 sent online. -1 on error."""
+    try:
+        sha1 = hashlib.sha1(password.encode()).hexdigest().upper()
+        prefix, suffix = sha1[:5], sha1[5:]
+        resp = requests.get(f"https://api.pwnedpasswords.com/range/{prefix}",
+                            timeout=5, headers={"Add-Padding": "true"})
+        for line in resp.text.splitlines():
+            h, count = line.split(":")
+            if h == suffix:
+                return int(count)
+        return 0
+    except Exception:
+        return -1
 
 # ─────────────────────────────────────────────
 #  REUSABLE UI HELPERS
@@ -373,6 +398,7 @@ class PasswordVaultApp:
             ("🔍  Analyse a Password",       self.show_analyse),
             ("⚡  Generate & Save Password", self.show_generate),
             ("📂  View Saved Passwords",     self.show_saved),
+            ("📊  Analytics Dashboard",       self.show_analytics),
         ]
 
         for text, cmd in items:
@@ -481,6 +507,34 @@ class PasswordVaultApp:
 
         btn(body, "Analyse", do_analyse).pack(fill="x", pady=(14, 0))
         pw_entry.bind("<KeyRelease>", do_analyse)
+
+        # ── Breach Checker
+        separator(body).pack(fill="x", pady=8)
+        section_title(body, "Breach Checker  🌐").pack(anchor="w", pady=(0, 6))
+        breach_frame = tk.Frame(body, bg=BG2, highlightthickness=1, highlightbackground=BORDER)
+        breach_frame.pack(fill="x", ipady=4)
+        breach_lbl = tk.Label(breach_frame, text="Click below to check if this password was ever leaked online",
+                              bg=BG2, fg=GREY, font=FONT_SMALL, anchor="w", padx=10, pady=6)
+        breach_lbl.pack(fill="x")
+
+        def do_breach_check():
+            pwd = pw_entry.get()
+            if not pwd:
+                messagebox.showwarning("No Password", "Enter a password first.")
+                return
+            breach_lbl.config(text="⏳ Checking online database...", fg=GREY)
+            body.update()
+            def run():
+                count = check_breach(pwd)
+                if count == -1:
+                    breach_lbl.config(text="⚠ No internet — could not check.", fg=ORANGE)
+                elif count == 0:
+                    breach_lbl.config(text="✅ Safe! Never found in any real data breach.", fg=GREEN)
+                else:
+                    breach_lbl.config(text=f"🚨 DANGER! Found in {count:,} breaches! Never use this.", fg=RED)
+            threading.Thread(target=run, daemon=True).start()
+
+        btn(body, "🌐  Check Breach", do_breach_check, pady=5).pack(fill="x", pady=(6, 0))
 
     # ══════════════════════════════════════════
     #  SCREEN 4 — GENERATE & SAVE
@@ -705,6 +759,121 @@ class PasswordVaultApp:
                 return toggle_b
 
             make_toggle()
+
+    # ══════════════════════════════════════════
+    #  SCREEN 6 — ANALYTICS DASHBOARD
+    # ══════════════════════════════════════════
+    def show_analytics(self):
+        self.clear()
+        self._center(480, 600)
+        self._header("📊  Analytics Dashboard", show_back=True, back_cmd=self.show_dashboard)
+
+        vault     = load_vault()
+        passwords = vault.get("passwords", {})
+
+        body = styled_frame(self.root, padx=24, pady=16)
+        body.pack(fill="both", expand=True)
+
+        if not passwords:
+            label(body, "No passwords saved yet — nothing to analyse.", fg=GREY).pack(pady=40)
+            btn(body, "Go Generate One", self.show_generate).pack()
+            return
+
+        # ── Calculate stats ──────────────────
+        total   = len(passwords)
+        strong  = medium = weak = 0
+        oldest_app, oldest_days = None, -1
+        today = date.today()
+
+        for app, data in passwords.items():
+            try:
+                plain = decrypt_password(data["encrypted_password"], self.master_password)
+                score = analyse_password(plain)["score"]
+                if score >= 70:   strong += 1
+                elif score >= 40: medium += 1
+                else:             weak   += 1
+            except Exception:
+                medium += 1
+
+            saved_on = data.get("saved_on", "")
+            if saved_on:
+                try:
+                    d = date.fromisoformat(saved_on)
+                    age = (today - d).days
+                    if age > oldest_days:
+                        oldest_days = age
+                        oldest_app  = app
+                except Exception:
+                    pass
+
+        # ── Stat cards row ───────────────────
+        cards_frame = styled_frame(body)
+        cards_frame.pack(fill="x", pady=(0, 16))
+
+        def stat_card(parent, value, label_text, color):
+            f = tk.Frame(parent, bg=BG2, highlightthickness=1,
+                         highlightbackground=color)
+            f.pack(side="left", expand=True, fill="x", padx=4, ipady=10)
+            tk.Label(f, text=str(value), bg=BG2, fg=color,
+                     font=("Segoe UI", 20, "bold")).pack()
+            tk.Label(f, text=label_text, bg=BG2, fg=GREY,
+                     font=FONT_SMALL).pack()
+
+        stat_card(cards_frame, total,  "Total",  MAROON)
+        stat_card(cards_frame, strong, "Strong", GREEN)
+        stat_card(cards_frame, medium, "Medium", ORANGE)
+        stat_card(cards_frame, weak,   "Weak",   RED)
+
+        # ── Pie Chart ────────────────────────
+        section_title(body, "Strength Distribution").pack(anchor="w", pady=(0, 8))
+
+        fig, ax = plt.subplots(figsize=(4.2, 2.6), facecolor="#0a0a0a")
+        ax.set_facecolor("#0a0a0a")
+
+        sizes  = [strong, medium, weak]
+        labels = ["Strong", "Medium", "Weak"]
+        colors = [GREEN, ORANGE, RED]
+        sizes  = [s for s in sizes if s > 0]
+        labels = [l for s, l in zip([strong, medium, weak], labels) if s > 0]
+        colors = [c for s, c in zip([strong, medium, weak], colors) if s > 0]
+
+        if sizes:
+            wedges, texts, autotexts = ax.pie(
+                sizes, labels=labels, colors=colors,
+                autopct="%1.0f%%", startangle=90,
+                textprops={"color": WHITE, "fontsize": 8},
+                wedgeprops={"linewidth": 2, "edgecolor": "#0a0a0a"}
+            )
+            for at in autotexts:
+                at.set_fontsize(8)
+                at.set_color(WHITE)
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    color=GREY, transform=ax.transAxes)
+
+        ax.set_title("Password Strength Breakdown", color=WHITE, fontsize=9, pad=8)
+        plt.tight_layout(pad=0.5)
+
+        chart_frame = tk.Frame(body, bg=BG)
+        chart_frame.pack(fill="x")
+        canvas_widget = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(fill="x")
+        plt.close(fig)
+
+        # ── Oldest password warning ───────────
+        separator(body).pack(fill="x", pady=10)
+        if oldest_app and oldest_days >= 0:
+            color = RED if oldest_days > 90 else ORANGE if oldest_days > 30 else GREEN
+            icon  = "🚨" if oldest_days > 90 else "⚠" if oldest_days > 30 else "✅"
+            warn_frame = tk.Frame(body, bg=BG2, highlightthickness=1,
+                                  highlightbackground=color)
+            warn_frame.pack(fill="x", ipady=8)
+            tk.Label(warn_frame, text=f"{icon}  Oldest Password",
+                     bg=BG2, fg=color, font=FONT_BOLD, anchor="w", padx=10).pack(fill="x", pady=(6,0))
+            tk.Label(warn_frame,
+                     text=f"{oldest_app}  ·  {oldest_days} days old{'  — Consider updating!' if oldest_days > 90 else ''}",
+                     bg=BG2, fg=WHITE, font=FONT_SMALL, anchor="w", padx=10).pack(fill="x", pady=(0,6))
 
 # ─────────────────────────────────────────────
 #  ENTRY POINT
