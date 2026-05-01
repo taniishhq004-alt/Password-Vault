@@ -1,3 +1,13 @@
 vault.json
 __pycache__/
 *.pyc
+.agents
+.cursor
+.github
+.jetro
+data/
+projects/
+.mcp.json
+.windsurfrules
+AGENT.md
+CLAUDE.md
